@@ -81,7 +81,7 @@ class VWSession:
         # Start VW Session
         with self.session.get(LOGIN_URL, timeout=HTTP_TIMEOUT, headers=self.header) as r:
             if r.status_code != 200:
-                raise UnauthorizedError(f"Unexpected return code {r.status_code}")
+                raise SessionError(f"Unexpected return code {r.status_code} while getting login page.")
 
             soup = BeautifulSoup(r.text, 'html.parser')
 
@@ -90,27 +90,50 @@ class VWSession:
         hmac = soup.find(id="hmac").attrs.get("value")
         next_url = soup.find(id="emailPasswordForm").attrs.get("action")
 
+        if csrf == None or relay_state == None or hmac == None or next_url == None:
+            raise SessionError(f"Error parsing login page.")
+
         # Enter email
         params = {"_csrf": csrf, "relayState": relay_state, "hmac": hmac, "email": self.email}
         with self.session.post(VW_IDENTITY_HOST + next_url, params=params, timeout=HTTP_TIMEOUT, headers=self.header) as r:
             if r.status_code != 200:
-                raise UnauthorizedError(f"Unexpected return code {r.status_code}")
+                raise SessionError(f"Unexpected return code {r.status_code} while getting login page 2.")
             soup = BeautifulSoup(r.text, 'html.parser')
-
+                
         script_field = soup.select_one('script:-soup-contains("templateModel:")').string
 
         templateModel = json.loads(re.search(r"templateModel\s*:\s*({.*})\s*,\s*\n",script_field).group(1))
         hmac = templateModel["hmac"]
         relay_state = templateModel["relayState"]
         csrf = re.search(r"csrf_token\s*:\s*[\"\'](.*)[\"\']\s*,?\s*\n", script_field).group(1)
-        next_url = f"/signin-service/v1/{templateModel['clientLegalEntityModel']['clientId']}/{templateModel['postAction']}"
+        next_url = None
+        if 'postAction' in templateModel:
+            next_url = f"/signin-service/v1/{templateModel['clientLegalEntityModel']['clientId']}/{templateModel['postAction']}"
+
+        if csrf == None or relay_state == None or hmac == None or next_url == None:
+            if soup.find(id= 'emailPasswordForm'):
+                raise SessionError("User not found. Please use a valid VW ID.")
+            else:
+                raise SessionError(f"Error parsing login page 2")
 
         # Enter password
         params = {"_csrf": csrf, "relayState": relay_state, "hmac": hmac, "email": self.email, "password": self.password}
 
         with self.session.post(VW_IDENTITY_HOST + next_url, params=params, timeout=HTTP_TIMEOUT, headers=self.header) as r:
             if r.status_code != 200:
-                raise UnauthorizedError(f"Unexpected return code {r.status_code}")
+                raise SessionError(f"Unexpected return code {r.status_code} while getting password page.")
+            soup = BeautifulSoup(r.text, 'html.parser')
+
+        if 'login.errors.password_invalid' in r.text:
+            raise SessionError("Password is incorrect.")
+        elif 'login.error.throttled' in r.text:
+            raise SessionError("Multiple retries with incorrect password. Please try again later.")
+
+        if soup.find(id = 'emailPasswordForm') and 'action' in soup.find(id = 'emailPasswordForm').attrs:
+            epf_action = soup.find(id = 'emailPasswordForm').attrs.get('action')
+            if epf_action and 'terms-and-conditions' in epf_action:
+                raise SessionError("Please log in to your VW account using the website. There may be new terms and conditions to accept before you can continue using this app.")
+
 
         # get global config
         with self.session.get(VW_GLOBAL_CONFIG_URL, timeout=HTTP_TIMEOUT, headers=self.header) as r:
@@ -133,7 +156,7 @@ class VWSession:
         headers = {"X-CSRF-TOKEN": csrf}
         with self.session.get(TOKEN_URL, headers={**headers, **self.header}, timeout=HTTP_TIMEOUT) as r:
             if r.status_code != 200:
-                raise UnauthorizedError(f"Unexpected return code {r.status_code}")
+                raise SessionError(f"Unexpected return code {r.status_code} while getting tokens")
             self.token_timestamp = time.time()
             self.tokens = json.loads(r.text)
 
@@ -160,7 +183,7 @@ class VWSession:
         headers = {"Authorization": "Bearer " + self.tokens.get("access_token")}
         with self.session.get(LOUNGE_CARS_URL, headers={**headers, **self.header}, timeout=HTTP_TIMEOUT) as lounge_request:
             if lounge_request.status_code != 200:
-                raise UnauthorizedError(f"Unexpected return code from lounge API:  {lounge_request.status_code}")
+                raise SessionError(f"Unexpected return code from lounge API:  {lounge_request.status_code}")
             lounge_request_text = lounge_request.text
 
         # Get relations data
@@ -168,7 +191,7 @@ class VWSession:
         with self.session.get(RELATIONS_URL_V2, headers={**headers, **self.header}, timeout=HTTP_TIMEOUT) as relations_request:
             if relations_request.status_code != 200:
 
-                raise UnauthorizedError(f"Unexpected return code from Relations API: {relations_request.status_code}")
+                raise SessionError(f"Unexpected return code from Relations API: {relations_request.status_code}")
             relations_request_text = relations_request.text
 
         return {
